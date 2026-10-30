@@ -1,0 +1,154 @@
+name: DevSecOps Security Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 2 * * 1"
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: "Authorized DAST target"
+        type: choice
+        required: true
+        default: staging
+        options: [staging, production]
+      production_authorization:
+        description: "For production, enter AUTHORIZED after approval"
+        type: string
+        required: false
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: devsecops-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codeql:
+    name: CodeQL SAST (JavaScript/TypeScript)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+
+  secrets-and-dependencies:
+    name: Secret and dependency scanning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+      - name: Dependency review
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+  burp-dast:
+    name: Burp Suite DAST
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      vars.BURP_STAGING_URL != ''
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      target_url: ${{ steps.target.outputs.url }}
+      target_environment: ${{ steps.target.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate and select authorized target
+        id: target
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ENV: ${{ inputs.target_environment }}
+          PROD_CONFIRM: ${{ inputs.production_authorization }}
+          STAGING_URL: ${{ vars.BURP_STAGING_URL }}
+          PRODUCTION_URL: ${{ vars.BURP_PRODUCTION_URL }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$INPUT_ENV" == "production" ]]; then
+            [[ "$PROD_CONFIRM" == "AUTHORIZED" ]] || { echo "Production requires exact AUTHORIZED confirmation." >&2; exit 1; }
+            [[ -n "$PRODUCTION_URL" ]] || { echo "BURP_PRODUCTION_URL is not configured." >&2; exit 1; }
+            URL="$PRODUCTION_URL"
+            ENVIRONMENT="production-security-scan"
+          else
+            URL="$STAGING_URL"
+            ENVIRONMENT="staging-security-scan"
+            [[ -n "$URL" ]] || { echo "BURP_STAGING_URL is not configured." >&2; exit 1; }
+          fi
+          python - "$URL" <<'PY'
+          import sys
+          from urllib.parse import urlparse
+          u = urlparse(sys.argv[1])
+          if u.scheme != "https" or not u.hostname:
+              raise SystemExit("Target must be a valid HTTPS URL.")
+          PY
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+
+      - name: Run official Burp DAST scanner container
+        env:
+          BURP_ENTERPRISE_SERVER_URL: ${{ secrets.BURP_ENTERPRISE_SERVER_URL }}
+          BURP_ENTERPRISE_API_KEY: ${{ secrets.BURP_ENTERPRISE_API_KEY }}
+          BURP_START_URLS: ${{ steps.target.outputs.url }}
+          BURP_CORRELATION_ID: ${{ github.repository }}-${{ github.run_id }}
+          BURP_REPORT_FILE_PATH: burp_junit_report.xml
+          BURP_REPORT_FORMATS: JUNIT
+          BURP_REPORT_THRESHOLD_ENABLED: "true"
+          BURP_REPORT_THRESHOLD_MINIMUM_SEVERITY: HIGH
+          BURP_REPORT_THRESHOLD_MINIMUM_CONFIDENCE: FIRM
+          BURP_SITE_OUT_OF_SCOPE_URL_PREFIXES: ${{ vars.BURP_OUT_OF_SCOPE_URLS }}
+          BURP_SCANNER_IMAGE: ${{ vars.BURP_SCANNER_IMAGE }}
+        run: |
+          set -euo pipefail
+          : "${BURP_ENTERPRISE_SERVER_URL:?Set repository secret BURP_ENTERPRISE_SERVER_URL}"
+          : "${BURP_ENTERPRISE_API_KEY:?Set repository secret BURP_ENTERPRISE_API_KEY}"
+          : "${BURP_START_URLS:?No authorized scan target configured}"
+          : "${BURP_SCANNER_IMAGE:?Set BURP_SCANNER_IMAGE to a version compatible with your DAST server}"
+          docker run --rm --pull=always -u "$(id -u)" -v "$PWD:$PWD" -w "$PWD" \
+            -e BURP_ENTERPRISE_SERVER_URL -e BURP_ENTERPRISE_API_KEY -e BURP_START_URLS \
+            -e BURP_CORRELATION_ID -e BURP_REPORT_FILE_PATH -e BURP_REPORT_FORMATS \
+            -e BURP_REPORT_THRESHOLD_ENABLED -e BURP_REPORT_THRESHOLD_MINIMUM_SEVERITY \
+            -e BURP_REPORT_THRESHOLD_MINIMUM_CONFIDENCE -e BURP_SITE_OUT_OF_SCOPE_URL_PREFIXES \
+            "$BURP_SCANNER_IMAGE"
+
+      - name: Upload Burp report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: burp-dast-${{ github.run_id }}
+          path: |
+            burp_junit_report.xml
+            burp_xml_report.xml
+          if-no-files-found: warn
+          retention-days: 30
