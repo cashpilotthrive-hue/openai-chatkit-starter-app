@@ -74,6 +74,8 @@ jobs:
   burp-dast:
     name: Burp Suite DAST
     runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.target_environment == 'production' && 'production-security-scan' || 'staging-security-scan' }}
     if: >-
       github.event_name == 'workflow_dispatch' ||
       vars.BURP_STAGING_URL != ''
